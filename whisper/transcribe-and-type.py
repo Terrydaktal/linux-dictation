@@ -19,7 +19,7 @@ DELIVERY_REPORT_URL = os.environ.get(
         WHISPER_SERVER_URL.rsplit("/", 1)[0] + "/desktop-delivery-report",
     ),
 )
-TYPE_HELPER = Path(__file__).with_name("wayland-type-helper.sh")
+TYPE_HELPER = Path(__file__).resolve().parent.parent / "wayland-type-helper.sh"
 
 
 def log(message: str, *, error: bool = False) -> None:

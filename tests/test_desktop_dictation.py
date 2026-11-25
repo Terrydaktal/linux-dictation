@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 MODULE_PATH = (
     Path(__file__).resolve().parents[1]
-    / "desktop_dictation"
+    / "whisper"
     / "transcribe-and-type.py"
 )
 SPEC = importlib.util.spec_from_file_location("transcribe_and_type", MODULE_PATH)

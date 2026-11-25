@@ -9,9 +9,6 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
-
-from whisper_service import resume_desktop_dictation_queue
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -133,7 +130,7 @@ class DesktopRecordingQueueTests(unittest.TestCase):
 
     def launch(self, script):
         proc = subprocess.Popen(
-            [str(ROOT / "desktop_dictation" / script)],
+            [str(ROOT / "whisper" / script)],
             env=self.env,
             stdin=subprocess.DEVNULL,
             stdout=self.output,
@@ -357,16 +354,23 @@ class DesktopRecordingQueueTests(unittest.TestCase):
         self.assertFalse(first.with_suffix(".json").exists())
         self.assertFalse(second.with_suffix(".json").exists())
 
-    def test_real_whisper_startup_hook_wakes_existing_retry(self):
+    def test_background_wakeup_resumes_existing_retry(self):
         audio = self.add_completed("recording-001.wav")
         self.launch("queue-worker.sh")
         self.wait_for_retry()
         (self.root / "server-ready").touch()
-        with patch.dict(os.environ, self.env), patch("whisper_service.print") as log:
-            resume_desktop_dictation_queue()
+        wakeup = subprocess.run(
+            [str(ROOT / "whisper" / "queue-worker.sh"), "--background"],
+            env=self.env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=True,
+        )
+        self.assertEqual(wakeup.returncode, 0)
         self.wait_for(lambda: not audio.exists())
         self.assertEqual(self.lines("served"), [audio.name])
-        self.assertIn("waking the queue worker now", log.call_args.args[0])
 
     def test_rapid_recordings_are_all_served_once_in_order(self):
         (self.root / "server-ready").touch()
