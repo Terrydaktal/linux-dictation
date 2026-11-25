@@ -87,6 +87,7 @@ def transcribe(audio_path: Path) -> tuple[str, dict[str, int], int]:
         data=audio_data,
         headers={
             "Content-Type": "application/octet-stream",
+            "X-Client-Delivery-Report": "desktop",
             "X-Client-Recording-Duration-Ms": str(
                 metadata_integer(metadata, "recording_duration_ms")
             ),
@@ -193,7 +194,11 @@ def main() -> int:
     try:
         text, _timings, stop_requested_ms = transcribe(audio_path)
         if text:
-            type_ms, inserted, refusal_reason = type_text(text)
+            try:
+                type_ms, inserted, refusal_reason = type_text(text)
+            except Exception as exc:
+                report_delivery("failed", f"error={exc}")
+                raise
             delivery_details = format_delivery_timing(
                 _timings, stop_requested_ms, type_ms
             )

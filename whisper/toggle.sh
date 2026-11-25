@@ -15,6 +15,7 @@ recorder_action_lock_file="$runtime_root/recorder-action.lock"
 log_file="$state_root/dictation.log"
 toggle_lock="$runtime_root/toggle.lock"
 pipewire_health_delay_s="${ASSISTANT_PIPEWIRE_HEALTH_DELAY_S:-0.75}"
+pipewire_startup_timeout_ms="${ASSISTANT_PIPEWIRE_STARTUP_TIMEOUT_MS:-3000}"
 configured_alsa_device="${ASSISTANT_ALSA_DEVICE:-}"
 
 mkdir -p "$queue_dir" "$runtime_root"
@@ -26,7 +27,7 @@ log() {
 }
 
 start_worker() {
-	nohup "$script_dir/queue-worker.sh" >>"$log_file" 2>&1 9>&- &
+	nohup "$script_dir/queue-worker.sh" >>"$log_file" 2>&1 8>&- 9>&- &
 }
 
 wav_bytes() {
@@ -34,7 +35,7 @@ wav_bytes() {
 }
 
 find_direct_alsa_device() {
-	local device
+	local device listing status
 	if [[ -n "$configured_alsa_device" ]]; then
 		if [[ "$configured_alsa_device" == *:* ]]; then
 			printf '%s\n' "$configured_alsa_device"
@@ -45,12 +46,18 @@ find_direct_alsa_device() {
 	fi
 
 	if ! command -v arecord >/dev/null 2>&1; then
+		log "ERROR: direct ALSA fallback unavailable: arecord is not in the recorder's PATH"
 		return 1
 	fi
 
-	device="$({
-		LC_ALL=C arecord -l 2>/dev/null || true
-	} | awk '
+	if listing="$(LC_ALL=C timeout 2s arecord -l 2>&1)"; then
+		:
+	else
+		status=$?
+		log "ERROR: ALSA capture-device lookup failed status=$status: ${listing//$'\n'/; }"
+		return 1
+	fi
+	device="$(awk '
         tolower($0) ~ /yeti stereo microphone/ {
             match($0, /^card [0-9]+/)
             card = substr($0, RSTART + 5, RLENGTH - 5)
@@ -61,15 +68,13 @@ find_direct_alsa_device() {
                 exit
             }
         }
-    }')"
+    ' <<<"$listing")"
 	if [[ -n "$device" ]]; then
 		printf '%s\n' "$device"
 		return 0
 	fi
 
-	device="$({
-		LC_ALL=C arecord -l 2>/dev/null || true
-	} | awk '
+	device="$(awk '
         match($0, /^card [0-9]+/) {
             card = substr($0, RSTART + 5, RLENGTH - 5)
             match($0, /device [0-9]+/)
@@ -79,8 +84,12 @@ find_direct_alsa_device() {
                 exit
             }
         }
-    }')"
-	[[ -n "$device" ]] && printf '%s\n' "$device"
+    ' <<<"$listing")"
+	if [[ -z "$device" ]]; then
+		log "ERROR: ALSA reported no capture devices: ${listing//$'\n'/; }"
+		return 1
+	fi
+	printf '%s\n' "$device"
 }
 
 stop_recorder() {
@@ -109,7 +118,7 @@ launch_direct_alsa() {
 		return 1
 	fi
 
-	arecord -D "$device" -f S16_LE -r 16000 -c 1 "$audio_file" >>"$log_file" 2>&1 9>&- &
+	arecord -D "$device" -f S16_LE -r 16000 -c 1 "$audio_file" >>"$log_file" 2>&1 8>&- 9>&- &
 	started_recorder_pid=$!
 	started_recorder_backend="alsa:$device"
 }
@@ -124,7 +133,16 @@ fallback_to_direct_alsa_locked() {
 	current_backend="$(<"$recorder_backend_file")"
 	[[ "$current_backend" == "pipewire" ]] || return 1
 
+	# Samples may arrive while the health checker waits for the action lock.
+	if (($(wav_bytes "$audio_file") > 44)); then
+		log "PipeWire produced audio before fallback; keeping recording file=$audio_file"
+		return 0
+	fi
 	stop_recorder "$pipewire_pid" "PipeWire"
+	if (($(wav_bytes "$audio_file") > 44)); then
+		log "WARNING: PipeWire flushed audio during shutdown; preserving it instead of overwriting with ALSA file=$audio_file"
+		return 1
+	fi
 	if ! launch_direct_alsa "$audio_file"; then
 		log "ERROR: PipeWire capture failed and direct ALSA fallback could not start"
 		return 1
@@ -148,21 +166,37 @@ fallback_to_direct_alsa() {
 monitor_pipewire_startup() {
 	local audio_file="$1"
 	local pipewire_pid="$2"
-	local bytes current_backend
+	local bytes current_backend started_ms elapsed_ms
+	local waiting_logged=false
+	started_ms="$(date '+%s%3N')"
 
 	sleep "$pipewire_health_delay_s"
-	[[ -f "$current_file" ]] || return 0
-	[[ "$(<"$current_file")" == "$audio_file" ]] || return 0
-	current_backend="$(<"$recorder_backend_file")"
-	[[ "$current_backend" == "pipewire" ]] || return 0
+	while true; do
+		[[ -f "$current_file" && -f "$recorder_backend_file" ]] || return 0
+		[[ "$(<"$current_file")" == "$audio_file" ]] || return 0
+		current_backend="$(<"$recorder_backend_file")"
+		[[ "$current_backend" == "pipewire" ]] || return 0
 
-	bytes="$(wav_bytes "$audio_file")"
-	if kill -0 "$pipewire_pid" 2>/dev/null && ((bytes > 44)); then
-		log "PipeWire capture health check passed bytes=$bytes file=$audio_file"
-		return 0
-	fi
+		bytes="$(wav_bytes "$audio_file")"
+		elapsed_ms=$(($(date '+%s%3N') - started_ms))
+		if ! kill -0 "$pipewire_pid" 2>/dev/null; then
+			break
+		fi
+		if ((bytes > 44)); then
+			log "PipeWire capture health check passed bytes=$bytes startup_check_ms=$elapsed_ms file=$audio_file"
+			return 0
+		fi
+		if ((elapsed_ms >= pipewire_startup_timeout_ms)); then
+			break
+		fi
+		if [[ "$waiting_logged" == false ]]; then
+			log "PipeWire still starting; waiting for WAV samples (startup timeout ${pipewire_startup_timeout_ms}ms) file=$audio_file"
+			waiting_logged=true
+		fi
+		sleep 0.1
+	done
 
-	log "WARNING: PipeWire capture health check failed pid=$pipewire_pid bytes=$bytes; trying direct ALSA"
+	log "WARNING: PipeWire capture health check failed pid=$pipewire_pid bytes=$bytes after_ms=$elapsed_ms; trying direct ALSA"
 	fallback_to_direct_alsa "$audio_file" "$pipewire_pid" || true
 }
 
@@ -200,6 +234,8 @@ write_recording_metadata() {
 
 stop_recording() {
 	local pid audio_file recorder_backend recording_started_ms stop_requested_ms recording_ready_ms audio_bytes
+	local queued=false
+	stop_requested_ms="$(date '+%s%3N')"
 	exec 8>"$recorder_action_lock_file"
 	flock -x 8
 	pid="$(<"$pid_file")"
@@ -208,7 +244,6 @@ stop_recording() {
 	if [[ -f "$recorder_backend_file" ]]; then
 		recorder_backend="$(<"$recorder_backend_file")"
 	fi
-	stop_requested_ms="$(date '+%s%3N')"
 	recording_started_ms=-1
 	if [[ -f "$recording_started_file" ]]; then
 		recording_started_ms="$(<"$recording_started_file")"
@@ -216,9 +251,6 @@ stop_recording() {
 	if [[ -f "$recorder_health_pid_file" ]]; then
 		kill "$(<"$recorder_health_pid_file")" 2>/dev/null || true
 	fi
-	/usr/bin/rm -f "$pid_file" "$current_file" "$recording_started_file" \
-		"$recorder_backend_file" "$recorder_health_pid_file"
-
 	stop_recorder "$pid" "$recorder_backend"
 
 	audio_bytes="$(wav_bytes "$audio_file")"
@@ -227,24 +259,43 @@ stop_recording() {
 		write_recording_metadata \
 			"$audio_file" "$recording_started_ms" "$stop_requested_ms" "$recording_ready_ms"
 		log "Queued completed recording backend=$recorder_backend file=$audio_file bytes=$audio_bytes"
-		start_worker
+		queued=true
 	else
 		log "ERROR: discarding invalid recording backend=$recorder_backend file=$audio_file bytes=$audio_bytes (WAV header only or empty)"
 		/usr/bin/rm -f -- "$audio_file" "${audio_file%.wav}.json"
 	fi
+	# Publish completion only after the recorder and metadata are finalized.
+	/usr/bin/rm -f "$pid_file" "$current_file" "$recording_started_file" \
+		"$recorder_backend_file" "$recorder_health_pid_file"
 	exec 8>&-
+	if [[ "$queued" == true ]]; then
+		start_worker
+	fi
 }
 
 start_recording() {
 	local audio_file pid recorder_backend recording_started_ms
+	local pipewire_latency_ms="${ASSISTANT_PIPEWIRE_LATENCY_MS:-10}"
+	local -a pipewire_latency_args=()
 	audio_file="$queue_dir/recording-$(date '+%Y%m%d-%H%M%S-%N').wav"
 	recording_started_ms="$(date '+%s%3N')"
+	printf '%s\n' "$audio_file" >"$current_file"
 
 	if command -v pw-record >/dev/null 2>&1; then
-		pw-record --container wav --format s16 --rate 16000 --channels 1 "$audio_file" \
-			>>"$log_file" 2>&1 9>&- &
+		if [[ ! "$pipewire_latency_ms" =~ ^(0|[1-9][0-9]{0,3})$ ]] || ((pipewire_latency_ms > 1000)); then
+			log "WARNING: invalid ASSISTANT_PIPEWIRE_LATENCY_MS='$pipewire_latency_ms' (expected 0-1000); using 10ms"
+			pipewire_latency_ms=10
+		fi
+		# Request smaller stream buffers without pinning the global graph quantum.
+		# Zero restores PipeWire's automatic buffering for troubleshooting.
+		if ((pipewire_latency_ms > 0)); then
+			pipewire_latency_args=(--latency "${pipewire_latency_ms}ms")
+		fi
+		pw-record "${pipewire_latency_args[@]}" --container wav --format s16 --rate 16000 --channels 1 "$audio_file" \
+			>>"$log_file" 2>&1 8>&- 9>&- &
 		pid=$!
 		recorder_backend="pipewire"
+		log "PipeWire capture requested latency_ms=$pipewire_latency_ms (0=automatic) rate=16000 channels=1 format=s16"
 	elif command -v arecord >/dev/null 2>&1; then
 		if ! launch_direct_alsa "$audio_file"; then
 			log "ERROR: no supported recorder found (pw-record or direct ALSA arecord)"
@@ -254,7 +305,7 @@ start_recording() {
 		recorder_backend="$started_recorder_backend"
 	elif command -v parec >/dev/null 2>&1; then
 		parec --file-format=wav --format=s16le --rate=16000 --channels=1 \
-			--device=@DEFAULT_SOURCE@ "$audio_file" >>"$log_file" 2>&1 9>&- &
+			--device=@DEFAULT_SOURCE@ "$audio_file" >>"$log_file" 2>&1 8>&- 9>&- &
 		pid=$!
 		recorder_backend="parec"
 	else
@@ -265,12 +316,11 @@ start_recording() {
 		printf '%s\n' "$pid" >"$recorder_health_pid_file"
 	fi
 	printf '%s\n' "$pid" >"$pid_file"
-	printf '%s\n' "$audio_file" >"$current_file"
 	printf '%s\n' "$recording_started_ms" >"$recording_started_file"
 	printf '%s\n' "$recorder_backend" >"$recorder_backend_file"
 	log "Started recording backend=$recorder_backend pid=$pid file=$audio_file"
 	if [[ "$recorder_backend" == "pipewire" ]]; then
-		monitor_pipewire_startup "$audio_file" "$pid" >/dev/null 2>&1 9>&- &
+		monitor_pipewire_startup "$audio_file" "$pid" >/dev/null 2>&1 8>&- 9>&- &
 		printf '%s\n' "$!" >"$recorder_health_pid_file"
 	fi
 	start_worker
