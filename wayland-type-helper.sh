@@ -9,6 +9,10 @@ lock="$runtime/assistant-ydotool-type.lock"
 exec 9>"$lock"
 flock -x 9
 
+text=""
+IFS= read -r -d '' text || true
+[[ -n "$text" ]] || exit 0
+
 ydotool_ready() {
     ydotool key --key-delay 0 29:0 >/dev/null 2>&1
 }
@@ -45,6 +49,23 @@ ydotool key --key-delay 0 110:0 42:0 54:0 29:0 97:0 56:0 100:0 125:0 126:0 47:0 
 sleep 0.05
 
 type_pid=""
+watch_pid=""
+typing_started=0
+
+cleanup_typing() {
+    if [[ -n "$type_pid" ]]; then
+        kill -TERM "$type_pid" 2>/dev/null || true
+        wait "$type_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$watch_pid" ]]; then
+        kill -TERM "$watch_pid" 2>/dev/null || true
+        wait "$watch_pid" 2>/dev/null || true
+    fi
+}
+
+trap cleanup_typing EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 watch_for_modifier() {
     while kill -0 "$type_pid" 2>/dev/null; do
@@ -58,22 +79,43 @@ watch_for_modifier() {
     return 0
 }
 
-ydotool type --key-delay 0 --key-hold 0 --file=- <&0 &
-type_pid=$!
-watch_pid=""
-watch_for_modifier &
-watch_pid=$!
+type_chunk() {
+    local chunk="$1" delay="$2" hold="$3"
+    if modifier_held; then
+        if ((typing_started)); then
+            printf 'wayland-type-helper: refusing to continue typing because a modifier key was pressed during typing\n' >&2
+        else
+            printf 'wayland-type-helper: refusing to type because a modifier key is currently held\n' >&2
+        fi
+        return 5
+    fi
 
-type_status=0
-wait "$type_pid" || type_status=$?
+    ydotool type --key-delay "$delay" --key-hold "$hold" --file=- < <(printf '%s' "$chunk") &
+    type_pid=$!
+    typing_started=1
+    watch_for_modifier &
+    watch_pid=$!
 
-if kill -0 "$watch_pid" 2>/dev/null; then
-    kill -TERM "$watch_pid" 2>/dev/null || true
+    local type_status=0 watch_status=0
+    wait "$type_pid" || type_status=$?
+    type_pid=""
+    if kill -0 "$watch_pid" 2>/dev/null; then
+        kill -TERM "$watch_pid" 2>/dev/null || true
+    fi
+    wait "$watch_pid" || watch_status=$?
+    watch_pid=""
+
+    if ((watch_status == 5)); then
+        return 5
+    fi
+    return "$type_status"
+}
+
+# Pace only the opening characters so web editors can process the first input
+# before receiving the rest at full speed. Preserve stdin exactly, without a
+# dummy key, clipboard operation, or extra newline.
+type_chunk "${text:0:3}" 20 10
+if ((${#text} > 3)); then
+    sleep 0.03
+    type_chunk "${text:3}" 0 0
 fi
-watch_status=0
-wait "$watch_pid" || watch_status=$?
-
-if ((watch_status == 5)); then
-    exit 5
-fi
-exit "$type_status"
