@@ -23,12 +23,14 @@ linux-dictation/
 │   ├── toggle.sh                        # Num+- socat toggle (auto-starts stream-daemon.py)
 │   ├── stream-daemon.py                 # Combined live-streaming Rambler daemon (~37 MB RAM, ~2 ms toggle)
 │   ├── s3.py                            # S3Bidi Gemini v3 protobuf + HTTP/2 client
+│   ├── rambler.env.example              # Local credential template (~/.config/linux-dictation/rambler.env)
 │   └── net.local.linux-dictation-rambler.desktop # KDE launcher for Num+-
 ├── docs/
 │   └── desktop-recording-startup.md     # PipeWire vs ALSA microphone startup latency audit
 └── tests/
     ├── test_desktop_dictation.py
     ├── test_desktop_recording_queue.py
+    ├── test_rambler_stream_daemon.py
     └── test_wayland_type_helper.py
 ```
 
@@ -71,14 +73,21 @@ linux-dictation/
    cd ~/Dev/linux-dictation
    UV_CACHE_DIR=/data/.cache/uv uv sync
    ```
-2. Install KDE launchers into `~/.local/share/applications/` and rebuild KDE’s service cache:
+2. Configure local Rambler credentials (kept outside git):
+   ```sh
+   mkdir -p ~/.config/linux-dictation
+   cp rambler/rambler.env.example ~/.config/linux-dictation/rambler.env
+   chmod 600 ~/.config/linux-dictation/rambler.env
+   # Edit ~/.config/linux-dictation/rambler.env to fill RAMBLER_S3_API_KEY and RAMBLER_S3_ANDROID_CERT
+   ```
+3. Install KDE launchers into `~/.local/share/applications/` and rebuild KDE’s service cache:
    ```sh
    cp whisper/net.local.linux-dictation-whisper.desktop ~/.local/share/applications/
    cp rambler/net.local.linux-dictation-rambler.desktop ~/.local/share/applications/
    kbuildsycoca6 --noincremental
    ```
-3. Bind `Desktop Dictation Toggle` to `Num++` and `Rambler Dictation Toggle` to `Num+-` in KDE Shortcuts.
-4. For Whisper (`Num++`), start `whisper_service.py` from `~/Dev/transcription-server` (`127.0.0.1:5001`) — or record offline and let the queue drain automatically when the server starts. For Rambler (`Num+-`), pressing `Num+-` auto-starts `rambler/stream-daemon.py`.
+4. Bind `Desktop Dictation Toggle` to `Num++` and `Rambler Dictation Toggle` to `Num+-` in KDE Shortcuts.
+5. For Whisper (`Num++`), start `whisper_service.py` from `~/Dev/transcription-server` (`127.0.0.1:5001`) — or record offline and let the queue drain automatically when the server starts. For Rambler (`Num+-`), pressing `Num+-` auto-starts `rambler/stream-daemon.py`.
 
 ---
 

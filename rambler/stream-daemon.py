@@ -22,6 +22,7 @@ Mirrors Gboard's phone Rambler flow on the desktop, with unlimited-length safety
 from __future__ import annotations
 
 import array
+from collections import deque
 import errno
 import fcntl
 import json
@@ -55,6 +56,8 @@ STATE_ROOT = Path(
 ) / "rambler-desktop-dictation"
 ACTIVE_DIR = STATE_ROOT / "active"
 FAILED_DIR = STATE_ROOT / "failed"
+LAST_DELIVERED_WAV = STATE_ROOT / "last_delivered.wav"
+MAX_LAST_DELIVERED_BYTES = 10 * 1024 * 1024
 SOCK_PATH = RUNTIME_ROOT / "control.sock"
 LOCK_PATH = RUNTIME_ROOT / "daemon.lock"
 PID_PATH = RUNTIME_ROOT / "daemon.pid"
@@ -91,6 +94,8 @@ SEGMENT_SOFT_S = float(os.environ.get("RAMBLER_SEGMENT_SOFT_S", "180"))
 SEGMENT_HARD_S = float(os.environ.get("RAMBLER_SEGMENT_HARD_S", "240"))
 SILENCE_RMS_THRESHOLD = int(os.environ.get("RAMBLER_SILENCE_RMS", "400"))
 SILENCE_PAUSE_CHUNKS = int(os.environ.get("RAMBLER_SILENCE_PAUSE_CHUNKS", "3"))  # 3 * 100 ms
+TAIL_DRAIN_MS = int(os.environ.get("RAMBLER_TAIL_DRAIN_MS", "280"))
+TAIL_RMS_WINDOW_CHUNKS = 20  # ~2.0 s at 100 ms/chunk
 
 # Local Whisper fallback on S3 outage/error
 WHISPER_FALLBACK_ENABLED = os.environ.get("RAMBLER_WHISPER_FALLBACK", "1") != "0"
@@ -255,6 +260,24 @@ class ClientPool:
             return self._client
 
 
+def extract_grpc_status(headers, trailers=None) -> tuple[str, str]:
+    """Return (grpc_status, grpc_message) from HTTP/2 headers or trailers."""
+    status = ""
+    message = ""
+    for source in (trailers, headers):
+        if not source:
+            continue
+        items = source.items() if hasattr(source, "items") else source
+        for raw_k, raw_v in items:
+            k = (raw_k.decode("latin-1") if isinstance(raw_k, bytes) else str(raw_k)).lower()
+            v = raw_v.decode("utf-8", errors="replace") if isinstance(raw_v, bytes) else str(raw_v)
+            if k == "grpc-status" and not status:
+                status = v.strip()
+            elif k == "grpc-message" and not message:
+                message = v.strip()
+    return status, message
+
+
 class S3Segment:
     """One live ffmpeg + S3Bidi streaming segment (<= ~3-4 minutes)."""
 
@@ -264,15 +287,19 @@ class S3Segment:
         self.started_monotonic = time.monotonic()
         self.pcm_bytes = 0
         self.ogg_bytes = 0
+        self.max_rms = 0.0
+        self._recent_rms: deque[int] = deque(maxlen=TAIL_RMS_WINDOW_CHUNKS)
         self.flushed_ms = -1
         self.finished_ms = -1
         self.text = ""
         self.error: str | None = None
         self.used_buffered_retry = False
+        self.last_call_stats: dict[str, int | str] = {}
 
         self._ogg_q: queue.Queue[bytes | None] = queue.Queue()
         self._ogg_backup: list[bytes] = []
         self._closed_input = threading.Event()
+        self._encoder_done = threading.Event()
         self._done = threading.Event()
         self._ffmpeg = subprocess.Popen(
             [
@@ -312,11 +339,21 @@ class S3Segment:
         if self._closed_input.is_set() or self._ffmpeg.stdin is None:
             return
         self.pcm_bytes += len(data)
+        rms = pcm_rms(data)
+        if rms > self.max_rms:
+            self.max_rms = rms
+        self._recent_rms.append(int(rms))
         try:
             self._ffmpeg.stdin.write(data)
             self._ffmpeg.stdin.flush()
         except BrokenPipeError:
             pass
+
+    def tail_rms_summary(self) -> tuple[int, int]:
+        if not self._recent_rms:
+            return 0, 0
+        vals = list(self._recent_rms)
+        return int(sum(vals) / len(vals)), max(vals)
 
     def close_input(self) -> None:
         if self._closed_input.is_set():
@@ -328,8 +365,12 @@ class S3Segment:
             except Exception:  # noqa: BLE001
                 pass
 
-    def wait_done(self, timeout: float = 120.0) -> None:
-        self._done.wait(timeout=timeout)
+    def wait_done(self, timeout: float = 120.0) -> bool:
+        completed = self._done.wait(timeout=timeout)
+        if not completed and self.error is None:
+            self.error = f"segment {self.index} timed out after {timeout:.0f}s waiting for S3"
+            log(f"ERROR: {self.error}")
+        return completed
 
     def _drain_ogg_loop(self) -> None:
         assert self._ffmpeg.stdout is not None
@@ -344,6 +385,7 @@ class S3Segment:
         finally:
             self.flushed_ms = round(time.time() * 1000)
             self._ogg_q.put(None)
+            self._encoder_done.set()
             try:
                 self._ffmpeg.wait(timeout=5)
             except Exception:  # noqa: BLE001
@@ -360,9 +402,22 @@ class S3Segment:
             yield chunk
 
     def _stream_chunks_once(
-        self, client: httpx.Client, chunks_iter, sent_audio_flag: list[bool] | None = None
+        self,
+        client: httpx.Client,
+        chunks_iter,
+        sent_audio_flag: list[bool] | None = None,
+        mode: str = "live",
     ) -> str:
         sess = s3.S3Session()
+        started_mono = time.monotonic()
+        end_request_sent = [False]
+        end_req_ms = [-1]
+        frames_in = 0
+        events_in = 0
+        finals_in = 0
+        ep0_ms = -1
+        ep_end_ms = -1
+        first_final_ms = -1
 
         def gen():
             yield s3._grpc_frame(s3.header_request())
@@ -372,21 +427,34 @@ class S3Segment:
                         sent_audio_flag[0] = True
                     for i in range(0, len(chunk), 8192):
                         yield s3._grpc_frame(s3.chunk_request(chunk[i : i + 8192]))
+            end_request_sent[0] = True
+            end_req_ms[0] = round((time.monotonic() - started_mono) * 1000)
             yield s3._grpc_frame(s3.end_request())
 
         buf: list[bytes] = []
         out: list[bytes] = []
+        grpc_status = ""
+        grpc_msg = ""
         with client.stream(
-            "POST", f"https://{s3.HOST}{s3.PATH}", headers=s3.META, content=gen()
+            "POST", f"https://{s3.HOST}{s3.PATH}", headers=s3.load_s3_headers(), content=gen()
         ) as resp:
             if resp.status_code != 200:
                 raise RuntimeError(f"S3Bidi HTTP {resp.status_code}")
             for raw in resp.iter_raw():
                 buf.append(raw)
                 for msg in sess._split_frames(buf, out):
+                    frames_in += 1
                     d = s3.decode_response(msg)
                     if not d:
                         continue
+                    events_in += 1
+                    rel_ms = round((time.monotonic() - started_mono) * 1000)
+                    ep = d.get("endpointer")
+                    if ep is not None:
+                        if ep == 0 and ep0_ms < 0:
+                            ep0_ms = rel_ms
+                        elif ep >= 1 and ep_end_ms < 0:
+                            ep_end_ms = rel_ms
                     if d.get("errcode"):
                         raise RuntimeError(
                             f"S3 error {d.get('errcode')}: {d.get('errdesc', '')}"
@@ -398,17 +466,44 @@ class S3Segment:
                         fb = d.get("final_fb") or d.get("result_fb")
                         if fb:
                             final_list = [fb]
-                    if final_list and " ".join(final_list) not in sess._final:
-                        sess._final.append(" ".join(final_list))
-        return sess.final_text.strip()
+                    if final_list:
+                        finals_in += 1
+                        if first_final_ms < 0:
+                            first_final_ms = rel_ms
+                        if " ".join(final_list) not in sess._final:
+                            sess._final.append(" ".join(final_list))
+            trailers = resp.extensions.get("trailers") if hasattr(resp, "extensions") else None
+            grpc_status, grpc_msg = extract_grpc_status(resp.headers, trailers)
+
+        text = sess.final_text.strip()
+        self.last_call_stats = {
+            "mode": mode,
+            "endReqMs": end_req_ms[0],
+            "ep0Ms": ep0_ms,
+            "epEndMs": ep_end_ms,
+            "firstFinalMs": first_final_ms,
+            "framesIn": frames_in,
+            "eventsIn": events_in,
+            "finalsIn": finals_in,
+            "grpcStatus": grpc_status,
+        }
+        if grpc_status and grpc_status != "0" and not text:
+            raise RuntimeError(
+                f"S3Bidi gRPC status {grpc_status}: {grpc_msg}" if grpc_msg else f"S3Bidi gRPC status {grpc_status}"
+            )
+        if mode == "live" and not end_request_sent[0] and not text:
+            raise RuntimeError(
+                f"S3Bidi closed response before end_of_data (framesIn={frames_in}, grpcStatus={grpc_status or 'none'})"
+            )
+        return text
 
     def _run_s3_loop(self) -> None:
         client = self._pool.get()
         sent_audio = [False]
         try:
             try:
-                self.text = self._stream_chunks_once(
-                    client, self._live_chunk_iter(), sent_audio
+                live_text = self._stream_chunks_once(
+                    client, self._live_chunk_iter(), sent_audio, mode="live"
                 )
             except Exception as first_exc:  # noqa: BLE001
                 if not sent_audio[0] and not self._closed_input.is_set():
@@ -416,11 +511,32 @@ class S3Segment:
                         f"Segment {self.index}: reopening stale HTTP/2 connection ({first_exc})"
                     )
                     client = self._pool.reset(client)
-                    self.text = self._stream_chunks_once(
-                        client, self._live_chunk_iter(), sent_audio
+                    live_text = self._stream_chunks_once(
+                        client, self._live_chunk_iter(), sent_audio, mode="live"
                     )
                 else:
                     raise
+            if live_text:
+                self.text = live_text
+            else:
+                # Live stream returned empty without raising; if real non-silent audio was
+                # captured, retry once with the complete buffered Ogg before accepting empty speech.
+                self._encoder_done.wait(timeout=30.0)
+                if (
+                    self.pcm_bytes > 0
+                    and self.max_rms >= (SILENCE_RMS_THRESHOLD / 2.0)
+                    and self._ogg_backup
+                ):
+                    log(
+                        f"WARNING: segment {self.index} live S3 returned empty despite audio "
+                        f"(max_rms={int(self.max_rms)}, ogg_chunks={len(self._ogg_backup)}); "
+                        "retrying buffered audio"
+                    )
+                    self.used_buffered_retry = True
+                    client = self._pool.reset(client)
+                    self.text = self._stream_chunks_once(
+                        client, list(self._ogg_backup), mode="buffered"
+                    )
         except Exception as exc:  # noqa: BLE001
             log(
                 f"WARNING: segment {self.index} live S3Bidi failed ({exc}); "
@@ -428,11 +544,14 @@ class S3Segment:
             )
             while self._ogg_q.get() is not None:
                 pass
+            self._encoder_done.wait(timeout=30.0)
             if self.pcm_bytes > 0 and self._ogg_backup:
                 self.used_buffered_retry = True
                 client = self._pool.reset(client)
                 try:
-                    self.text = self._stream_chunks_once(client, list(self._ogg_backup))
+                    self.text = self._stream_chunks_once(
+                        client, list(self._ogg_backup), mode="buffered"
+                    )
                 except Exception as exc2:  # noqa: BLE001
                     self.error = str(exc2)
                     log(f"ERROR: segment {self.index} buffered S3 retry failed: {exc2}")
@@ -585,8 +704,18 @@ class LiveSession:
             proc = self._recorder
             backend = self._backend
         if proc is not None:
-            log(f"Stopping live {backend} recorder pid={proc.pid}")
-            stop_proc(proc, backend)
+            if TAIL_DRAIN_MS > 0:
+                # Drain a short post-Stop audio tail asynchronously so toggle.sh stays ~2 ms
+                # while PipeWire/ALSA flushes any trailing samples after Stop is pressed.
+                def _delayed_stop() -> None:
+                    time.sleep(TAIL_DRAIN_MS / 1000.0)
+                    log(f"Stopping live {backend} recorder pid={proc.pid} (tail_drain_ms={TAIL_DRAIN_MS})")
+                    stop_proc(proc, backend)
+
+                threading.Thread(target=_delayed_stop, daemon=True).start()
+            else:
+                log(f"Stopping live {backend} recorder pid={proc.pid}")
+                stop_proc(proc, backend)
 
     def _roll_segment(self, reason: str) -> S3Segment:
         prev = self._segments[-1]
@@ -618,6 +747,18 @@ class LiveSession:
         except OSError as exc:
             log(f"WARNING: could not preserve failed WAV {self._wav_path}: {exc}")
             return self._wav_path
+
+    def _retain_last_delivered_wav(self) -> None:
+        if not self._wav_path.exists():
+            return
+        try:
+            size = self._wav_path.stat().st_size
+            if 0 < size <= MAX_LAST_DELIVERED_BYTES:
+                shutil.move(str(self._wav_path), str(LAST_DELIVERED_WAV))
+                return
+        except OSError as exc:
+            log(f"WARNING: could not retain last_delivered.wav ({exc})")
+        self._cleanup_wav()
 
     def _cleanup_wav(self) -> None:
         try:
@@ -726,8 +867,10 @@ class LiveSession:
             parts = [s.text for s in self._segments if s.text]
             text = " ".join(parts).strip()
 
-        self._cleanup_wav()
+        self._retain_last_delivered_wav()
 
+        tail_avg_rms, tail_max_rms = last_seg.tail_rms_summary()
+        st = last_seg.last_call_stats
         log(
             "Rambler live transcription timing "
             f"recording_duration_ms={rec_duration_ms} "
@@ -735,6 +878,11 @@ class LiveSession:
             f"stop_to_flush_ms={flush_ms} "
             f"stop_to_transcript_ms={after_stop_s3_ms} "
             f"pcm_bytes={self._pcm_bytes} ogg_bytes={total_ogg_bytes} "
+            f"max_rms={int(last_seg.max_rms)} tail_avg_rms={tail_avg_rms} tail_max_rms={tail_max_rms} "
+            f"end_req_ms={st.get('endReqMs', -1)} ep0_ms={st.get('ep0Ms', -1)} "
+            f"ep_end_ms={st.get('epEndMs', -1)} first_final_ms={st.get('firstFinalMs', -1)} "
+            f"frames_in={st.get('framesIn', 0)} finals_in={st.get('finalsIn', 0)} "
+            f"grpc_status={st.get('grpcStatus', '')!r} "
             f"retry={used_retry} whisper_fallback={used_whisper_fallback} "
             f"text={text!r}"
         )

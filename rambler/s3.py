@@ -3,10 +3,9 @@
 Reverse-engineered from the PixelBoard 1.3.6 APK (Gboard 18.4.1 base):
 - gRPC over HTTP/2 to speechs3proto2-pa.googleapis.com:443
 - method speech.s3.S3StubbyClientConnectorService/S3Bidi (bidirectional streaming)
-- first-party credentials embedded in the APK (S3ConnectionUtil):
-    X-Goog-Api-Key  <REDACTED_S3_API_KEY>
-    X-Android-Package com.google.android.googlequicksearchbox
-    X-Android-Cert    <REDACTED_ANDROID_CERT>
+- credentials loaded locally from environment variables or
+  ~/.config/linux-dictation/rambler.env (RAMBLER_S3_API_KEY,
+  RAMBLER_S3_ANDROID_CERT, optional RAMBLER_S3_ANDROID_PACKAGE)
 - audio: Ogg/Opus 16 kHz mono, chunked into S3Request extension 293101
 - personalization (Zwieback auth token) is optional and omitted here
 
@@ -17,6 +16,7 @@ RecognizerEvent responses (partials, final hypothesis, endpointer events).
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import struct
 import threading
 import time
@@ -26,14 +26,65 @@ import httpx
 
 HOST = "speechs3proto2-pa.googleapis.com"
 PATH = "/speech.s3.S3StubbyClientConnectorService/S3Bidi"
+DEFAULT_ANDROID_PACKAGE = "com.google.android.googlequicksearchbox"
 
-META = {
-    "content-type": "application/grpc",
-    "te": "trailers",
-    "x-goog-api-key": "<REDACTED_S3_API_KEY>",
-    "x-android-package": "com.google.android.googlequicksearchbox",
-    "x-android-cert": "<REDACTED_ANDROID_CERT>",
-}
+
+def default_env_file() -> Path:
+    explicit = os.environ.get("RAMBLER_S3_ENV_FILE", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    xdg_config = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    base = Path(xdg_config).expanduser() if xdg_config else Path.home() / ".config"
+    return base / "linux-dictation" / "rambler.env"
+
+
+def _read_env_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.is_file():
+        return values
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        if key:
+            values[key] = val
+    return values
+
+
+def load_s3_headers(env_file: Path | None = None) -> dict[str, str]:
+    """Build gRPC request headers from environment variables or local rambler.env."""
+    cfg_path = env_file if env_file is not None else default_env_file()
+    file_vals = _read_env_file(cfg_path)
+
+    def _get_val(key: str, default: str = "") -> str:
+        env_v = os.environ.get(key)
+        if env_v is not None and env_v.strip():
+            return env_v.strip()
+        file_v = file_vals.get(key, "")
+        if file_v.strip():
+            return file_v.strip()
+        return default
+
+    api_key = _get_val("RAMBLER_S3_API_KEY")
+    android_cert = _get_val("RAMBLER_S3_ANDROID_CERT")
+    android_pkg = _get_val("RAMBLER_S3_ANDROID_PACKAGE", DEFAULT_ANDROID_PACKAGE)
+    if not api_key or not android_cert:
+        raise RuntimeError(
+            "Rambler S3 credentials not configured. Set RAMBLER_S3_API_KEY and "
+            f"RAMBLER_S3_ANDROID_CERT in your environment or in {cfg_path}"
+        )
+    return {
+        "content-type": "application/grpc",
+        "te": "trailers",
+        "x-goog-api-key": api_key,
+        "x-android-package": android_pkg,
+        "x-android-cert": android_cert,
+    }
 
 # ---------------------------------------------------------------- protobuf
 
@@ -317,7 +368,9 @@ class S3Session:
             finally:
                 done.set()
 
-        with client.stream("POST", f"https://{HOST}{PATH}", headers=META, content=gen()) as r:
+        with client.stream(
+            "POST", f"https://{HOST}{PATH}", headers=load_s3_headers(), content=gen()
+        ) as r:
             t = threading.Thread(target=reader, args=(r,), daemon=True)
             t.start()
             t.join(self.timeout_s)
