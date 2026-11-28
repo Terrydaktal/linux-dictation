@@ -4,7 +4,7 @@ Reverse-engineered from the PixelBoard 1.3.6 APK (Gboard 18.4.1 base):
 - gRPC over HTTP/2 to speechs3proto2-pa.googleapis.com:443
 - method speech.s3.S3StubbyClientConnectorService/S3Bidi (bidirectional streaming)
 - credentials loaded locally from environment variables or
-  ~/.config/linux-dictation/rambler.env (RAMBLER_S3_API_KEY,
+  ~/.config/dictation/rambler.env (RAMBLER_S3_API_KEY,
   RAMBLER_S3_ANDROID_CERT, optional RAMBLER_S3_ANDROID_PACKAGE)
 - audio: Ogg/Opus 16 kHz mono, chunked into S3Request extension 293101
 - personalization (Zwieback auth token) is optional and omitted here
@@ -35,7 +35,7 @@ def default_env_file() -> Path:
         return Path(explicit).expanduser()
     xdg_config = os.environ.get("XDG_CONFIG_HOME", "").strip()
     base = Path(xdg_config).expanduser() if xdg_config else Path.home() / ".config"
-    return base / "linux-dictation" / "rambler.env"
+    return base / "dictation" / "rambler.env"
 
 
 def _read_env_file(path: Path) -> dict[str, str]:

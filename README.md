@@ -1,4 +1,4 @@
-# Linux Dictation (`~/Dev/linux-dictation`)
+# Dictation (`~/Dev/dictation`)
 
 Wayland/KDE desktop voice dictation unifying both hotkey pipelines and a shared instant-paste helper:
 
@@ -11,20 +11,20 @@ Wayland/KDE desktop voice dictation unifying both hotkey pipelines and a shared 
 ## Project Structure
 
 ```text
-linux-dictation/
+dictation/
 ├── pyproject.toml                       # uv environment (httpx[http2])
 ├── wayland-type-helper.sh               # Shared instant paste + paced ydotool fallback helper
 ├── whisper/
 │   ├── toggle.sh                        # Num++ start/stop toggle, PipeWire health check & ALSA fallback
 │   ├── queue-worker.sh                  # Persistent FIFO queue & exponential-backoff retry worker
 │   ├── transcribe-and-type.py           # Uploads WAV to :5001/transcribe_raw, inserts text, reports delivery
-│   └── net.local.linux-dictation-whisper.desktop # KDE launcher for Num++
+│   └── net.local.dictation-whisper.desktop # KDE launcher for Num++
 ├── rambler/
 │   ├── toggle.sh                        # Num+- socat toggle (auto-starts stream-daemon.py)
 │   ├── stream-daemon.py                 # Combined live-streaming Rambler daemon (~37 MB RAM, ~2 ms toggle)
 │   ├── s3.py                            # S3Bidi Gemini v3 protobuf + HTTP/2 client
-│   ├── rambler.env.example              # Local credential template (~/.config/linux-dictation/rambler.env)
-│   └── net.local.linux-dictation-rambler.desktop # KDE launcher for Num+-
+│   ├── rambler.env.example              # Local credential template (~/.config/dictation/rambler.env)
+│   └── net.local.dictation-rambler.desktop # KDE launcher for Num+-
 ├── docs/
 │   └── desktop-recording-startup.md     # PipeWire vs ALSA microphone startup latency audit
 └── tests/
@@ -70,20 +70,20 @@ linux-dictation/
 
 1. Install Python dependencies with `uv`:
    ```sh
-   cd ~/Dev/linux-dictation
+   cd ~/Dev/dictation
    UV_CACHE_DIR=/data/.cache/uv uv sync
    ```
 2. Configure local Rambler credentials (kept outside git):
    ```sh
-   mkdir -p ~/.config/linux-dictation
-   cp rambler/rambler.env.example ~/.config/linux-dictation/rambler.env
-   chmod 600 ~/.config/linux-dictation/rambler.env
-   # Edit ~/.config/linux-dictation/rambler.env to fill RAMBLER_S3_API_KEY and RAMBLER_S3_ANDROID_CERT
+   mkdir -p ~/.config/dictation
+   cp rambler/rambler.env.example ~/.config/dictation/rambler.env
+   chmod 600 ~/.config/dictation/rambler.env
+   # Edit ~/.config/dictation/rambler.env to fill RAMBLER_S3_API_KEY and RAMBLER_S3_ANDROID_CERT
    ```
 3. Install KDE launchers into `~/.local/share/applications/` and rebuild KDE’s service cache:
    ```sh
-   cp whisper/net.local.linux-dictation-whisper.desktop ~/.local/share/applications/
-   cp rambler/net.local.linux-dictation-rambler.desktop ~/.local/share/applications/
+   cp whisper/net.local.dictation-whisper.desktop ~/.local/share/applications/
+   cp rambler/net.local.dictation-rambler.desktop ~/.local/share/applications/
    kbuildsycoca6 --noincremental
    ```
 4. Bind `Desktop Dictation Toggle` to `Num++` and `Rambler Dictation Toggle` to `Num+-` in KDE Shortcuts.
@@ -94,7 +94,7 @@ linux-dictation/
 ## Running Tests & Shell Validation
 
 ```sh
-cd ~/Dev/linux-dictation
+cd ~/Dev/dictation
 python3 -m unittest discover -s tests -v
 shellcheck wayland-type-helper.sh whisper/toggle.sh whisper/queue-worker.sh rambler/toggle.sh
 ```

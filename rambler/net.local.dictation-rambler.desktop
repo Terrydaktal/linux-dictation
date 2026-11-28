@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Exec=/home/lewis/Dev/linux-dictation/rambler/toggle.sh
+Exec=/home/lewis/Dev/dictation/rambler/toggle.sh
 Name=Rambler Dictation Toggle
 NoDisplay=true
 StartupNotify=false

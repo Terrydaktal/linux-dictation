@@ -1,5 +1,5 @@
 [project]
-name = "linux-dictation"
+name = "dictation"
 version = "0.1.0"
 description = "Wayland/KDE desktop voice dictation with local Whisper (Num++) and live-streaming Rambler (Num+-)"
 requires-python = ">=3.11"

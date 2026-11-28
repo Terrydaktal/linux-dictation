@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Exec=/home/lewis/Dev/linux-dictation/whisper/toggle.sh
+Exec=/home/lewis/Dev/dictation/whisper/toggle.sh
 Name=Desktop Dictation Toggle
 NoDisplay=true
 StartupNotify=false
